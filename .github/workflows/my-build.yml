@@ -42,9 +42,11 @@ jobs:
 
       - name: Bump Ghostty submodule
         id: ghostty
+        env:
+          GHOSTTY_REF: ${{ github.event.inputs.ghostty_ref || 'submodule' }}
         run: |
           set -euo pipefail
-          REF='${{ github.event.inputs.ghostty_ref || ''main'' }}'
+          REF="$GHOSTTY_REF"
           cd ghostty
           if [ "$REF" = "submodule" ]; then
             echo "Honoring cmux-pinned Ghostty commit: $(git rev-parse HEAD)"
