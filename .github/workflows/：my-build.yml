@@ -1,0 +1,189 @@
+name: Self-build (unsigned, self-use)
+
+# Build an ad-hoc signed cmux.app for personal use.
+# - Public fork, runs on free GitHub-hosted arm64 macOS runners.
+# - No Apple certs, no notarization, no Sparkle auto-update.
+# - Ghostty submodule can be pinned or bumped to latest main.
+# - Artifact is an arm64-only cmux.app.zip attached to the run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ghostty_ref:
+        description: 'Ghostty submodule ref. Use "submodule" to honor cmux pin, "main" for manaflow fork tip, or any tag/commit SHA.'
+        required: false
+        default: 'submodule'
+      configuration:
+        description: 'Build configuration'
+        required: false
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+  schedule:
+    # Weekly nightly rebuild against Ghostty main (Mondays 03:00 UTC).
+    - cron: '0 3 * * 1'
+
+concurrency:
+  group: my-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Bump Ghostty submodule
+        id: ghostty
+        run: |
+          set -euo pipefail
+          REF='${{ github.event.inputs.ghostty_ref || ''main'' }}'
+          cd ghostty
+          if [ "$REF" = "submodule" ]; then
+            echo "Honoring cmux-pinned Ghostty commit: $(git rev-parse HEAD)"
+          else
+            git fetch --tags origin "$REF" || git fetch --tags origin
+            git checkout --detach "$REF"
+          fi
+          GHOSTTY_SHA=$(git rev-parse HEAD)
+          echo "sha=$GHOSTTY_SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${GHOSTTY_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          echo "==> Ghostty at $GHOSTTY_SHA"
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          XCODE_APP="$(ls -d /Applications/Xcode_*.app /Applications/Xcode.app 2>/dev/null | sort -V | tail -n 1)"
+          [ -n "$XCODE_APP" ] || { echo "No Xcode.app found" >&2; exit 1; }
+          echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+
+      - name: Install zig 0.15.2
+        run: |
+          set -euo pipefail
+          ZIG_VER=0.15.2
+          curl -fSL "https://ziglang.org/download/${ZIG_VER}/zig-aarch64-macos-${ZIG_VER}.tar.xz" -o /tmp/zig.tar.xz
+          tar xf /tmp/zig.tar.xz -C /tmp
+          sudo mkdir -p /usr/local/bin /usr/local/lib
+          sudo cp -f /tmp/zig-aarch64-macos-${ZIG_VER}/zig /usr/local/bin/zig
+          sudo cp -rf /tmp/zig-aarch64-macos-${ZIG_VER}/lib /usr/local/lib/zig
+          zig version
+
+      - name: Cache GhosttyKit.xcframework (keyed by Ghostty SHA)
+        id: cache-ghosttykit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cmux/ghosttykit
+          key: ghosttykit-${{ steps.ghostty.outputs.sha }}-arm64
+
+      - name: Build GhosttyKit.xcframework (arm64 only)
+        env:
+          CMUX_GHOSTTYKIT_NO_PREBUILT: '1'
+        run: |
+          set -euo pipefail
+          if [ -d "ghostty/macos/GhosttyKit.xcframework" ] && [ "${{ steps.cache-ghosttykit.outputs.cache-hit }}" = 'true' ]; then
+            echo "Cache hit — ensure-ghosttykit.sh will reuse it"
+          fi
+          # Build arm64-only to halve compile time. Overrides the script's
+          # default universal build (Intel slice is useless on M-series).
+          if ! command -v zig >/dev/null; then exit 1; fi
+          # Patch: run zig build manually for arm64, then let ensure-ghosttykit.sh
+          # cache/symlink it. The official script forces universal; we shortcut.
+          if [ ! -d "ghostty/macos/GhosttyKit.xcframework" ]; then
+            pushd ghostty
+            zig build -Demit-xcframework=true -Dxcframework-target=aarch64 -Doptimize=ReleaseFast
+            popd
+          fi
+          # Populate cmux's cache + symlink the same way ensure-ghosttykit.sh does.
+          SHA="${{ steps.ghostty.outputs.sha }}"
+          CACHE_DIR="$HOME/.cache/cmux/ghosttykit/$SHA"
+          mkdir -p "$CACHE_DIR"
+          rm -rf "$CACHE_DIR/GhosttyKit.xcframework"
+          cp -R ghostty/macos/GhosttyKit.xcframework "$CACHE_DIR/GhosttyKit.xcframework"
+          xcrun ranlib "$CACHE_DIR/GhosttyKit.xcframework/macos-arm64/libghostty.a" || true
+          ln -sfn "$CACHE_DIR/GhosttyKit.xcframework" GhosttyKit.xcframework
+          echo "$SHA" > ghostty/macos/GhosttyKit.xcframework/.ghostty_sha
+          echo "$SHA" > ghostty/macos/GhosttyKit.xcframework/.ghostty_state_key
+
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: .spm-cache
+          key: spm-${{ hashFiles('GhosttyTabs.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved', 'Package.resolved') }}
+          restore-keys: spm-
+
+      - name: xcodebuild (arm64, unsigned)
+        env:
+          CONFIG: ${{ github.event.inputs.configuration || 'Release' }}
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project GhosttyTabs.xcodeproj \
+            -scheme cmux \
+            -configuration "$CONFIG" \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath build \
+            -clonedSourcePackagesDirPath .spm-cache \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Locate built app
+        id: app
+        run: |
+          set -euo pipefail
+          CONFIG="${{ github.event.inputs.configuration || 'Release' }}"
+          APP_PATH="$(ls -d "build/Build/Products/${CONFIG}/"*.app | head -n 1)"
+          [ -n "$APP_PATH" ] && [ -d "$APP_PATH" ]
+          echo "path=$APP_PATH" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$APP_PATH")" >> "$GITHUB_OUTPUT"
+          echo "==> Built $APP_PATH"
+
+      - name: Disable Sparkle auto-update in Info.plist
+        # Strip the feed URL so this self-build does not silently "update" itself
+        # back to an official release signed by manaflow.
+        run: |
+          set -euo pipefail
+          APP_PLIST="${{ steps.app.outputs.path }}/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Delete :SUFeedURL" "$APP_PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Delete :SUPublicEDKey" "$APP_PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Set :SUEnableAutomaticChecks false" "$APP_PLIST" 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Add :SUEnableAutomaticChecks bool false" "$APP_PLIST"
+          # Tag the build so it is obvious in About panel.
+          SHORT_SHA="${{ steps.ghostty.outputs.short }}"
+          /usr/libexec/PlistBuddy -c "Add :CMUXSelfBuild string selfbuild-ghostty-${SHORT_SHA}-$(date -u +%Y%m%d)" "$APP_PLIST" 2>/dev/null || true
+
+      - name: Ad-hoc sign the bundle
+        run: |
+          set -euo pipefail
+          APP_PATH="${{ steps.app.outputs.path }}"
+          # --deep covers embedded helpers, frameworks, xpc services, cmuxd.
+          # "-" identity = ad-hoc; no Apple cert required.
+          codesign --force --deep --sign - --timestamp=none "$APP_PATH"
+          codesign --verify --verbose=2 "$APP_PATH" || true
+
+      - name: Zip for upload
+        run: |
+          set -euo pipefail
+          APP_PATH="${{ steps.app.outputs.path }}"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" cmux-selfbuild-arm64.zip
+          ls -lh cmux-selfbuild-arm64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmux-selfbuild-arm64-${{ steps.ghostty.outputs.short }}
+          path: cmux-selfbuild-arm64.zip
+          if-no-files-found: error
+          retention-days: 30
