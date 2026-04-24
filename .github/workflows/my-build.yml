@@ -94,23 +94,21 @@ jobs:
           if [ -d "ghostty/macos/GhosttyKit.xcframework" ] && [ "${{ steps.cache-ghosttykit.outputs.cache-hit }}" = 'true' ]; then
             echo "Cache hit — ensure-ghosttykit.sh will reuse it"
           fi
-          # Build arm64-only to halve compile time. Overrides the script's
-          # default universal build (Intel slice is useless on M-series).
+          # Ghostty's build.zig requires -Dxcframework-target=universal (enum).
+          # The final cmux.app is still arm64-only (xcodebuild ARCHS=arm64);
+          # only the intermediate libghostty archive carries both slices.
           if ! command -v zig >/dev/null; then exit 1; fi
-          # Patch: run zig build manually for arm64, then let ensure-ghosttykit.sh
-          # cache/symlink it. The official script forces universal; we shortcut.
           if [ ! -d "ghostty/macos/GhosttyKit.xcframework" ]; then
             pushd ghostty
-            zig build -Demit-xcframework=true -Dxcframework-target=aarch64 -Doptimize=ReleaseFast
+            zig build -Demit-xcframework=true -Dxcframework-target=universal -Doptimize=ReleaseFast
             popd
           fi
-          # Populate cmux's cache + symlink the same way ensure-ghosttykit.sh does.
           SHA="${{ steps.ghostty.outputs.sha }}"
           CACHE_DIR="$HOME/.cache/cmux/ghosttykit/$SHA"
           mkdir -p "$CACHE_DIR"
           rm -rf "$CACHE_DIR/GhosttyKit.xcframework"
           cp -R ghostty/macos/GhosttyKit.xcframework "$CACHE_DIR/GhosttyKit.xcframework"
-          xcrun ranlib "$CACHE_DIR/GhosttyKit.xcframework/macos-arm64/libghostty.a" || true
+          xcrun ranlib "$CACHE_DIR/GhosttyKit.xcframework/macos-arm64_x86_64/libghostty.a" || true
           ln -sfn "$CACHE_DIR/GhosttyKit.xcframework" GhosttyKit.xcframework
           echo "$SHA" > ghostty/macos/GhosttyKit.xcframework/.ghostty_sha
           echo "$SHA" > ghostty/macos/GhosttyKit.xcframework/.ghostty_state_key
