@@ -35,6 +35,10 @@ concurrency:
   group: my-build-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write   # needed to fast-forward fork's main from upstream
+  actions: read
+
 jobs:
   build:
     runs-on: macos-15
@@ -46,7 +50,27 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 1
+          fetch-depth: 0   # need full history to fast-forward-merge upstream
+
+      - name: Sync fork with upstream manaflow-ai/cmux
+        # Uses the runner's built-in GITHUB_TOKEN (contents:write is granted at
+        # the permissions block above). This avoids needing contents:write on
+        # the externally-provided PAT that triggers this workflow.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RESP=$(curl -sS -w '\nHTTP %{http_code}\n' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/merge-upstream" \
+            -d '{"branch":"main"}' || true)
+          echo "$RESP"
+          # Then refresh the local workspace to pick up any newly-merged commits.
+          git fetch origin main
+          git reset --hard origin/main
+          git submodule update --init --recursive
 
       - name: Select Xcode
         run: |
@@ -82,6 +106,14 @@ jobs:
           set -euo pipefail
           ./scripts/download-prebuilt-ghosttykit.sh
           test -d GhosttyKit.xcframework
+
+      - name: Personalize About panel URLs (pre-build)
+        # Point the About panel's "GitHub" button and commit link at the fork
+        # instead of upstream. Source edit — no Info.plist field supports this.
+        run: |
+          set -euo pipefail
+          sed -i '' 's|manaflow-ai/cmux|wqq-java/cmux|g' Sources/cmuxApp.swift
+          grep -n "wqq-java/cmux" Sources/cmuxApp.swift | head -5 || true
 
       - name: Cache Swift packages
         uses: actions/cache@v4
@@ -129,6 +161,12 @@ jobs:
             || /usr/libexec/PlistBuddy -c "Add :SUEnableAutomaticChecks bool false" "$APP_PLIST"
           SHORT_SHA="${{ steps.ghostty.outputs.short }}"
           /usr/libexec/PlistBuddy -c "Add :CMUXSelfBuild string selfbuild-ghostty-${SHORT_SHA}-$(date -u +%Y%m%d)" "$APP_PLIST" 2>/dev/null || true
+          # About panel shows NSHumanReadableCopyright at the bottom. Use it as
+          # a personal build marker so the About window tells the user "this is
+          # a self-build I made", not an official manaflow release.
+          COPY_TEXT="自编版 · 构建者 暮色微凉丶 · ghostty ${SHORT_SHA}"
+          /usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright '$COPY_TEXT'" "$APP_PLIST" 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Add :NSHumanReadableCopyright string '$COPY_TEXT'" "$APP_PLIST"
 
       - name: Ad-hoc sign
         run: |
