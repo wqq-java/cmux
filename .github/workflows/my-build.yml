@@ -181,9 +181,82 @@ jobs:
           ls -lh cmux-selfbuild-arm64.zip
 
       - name: Upload artifact
+        id: upload
         uses: actions/upload-artifact@v4
         with:
           name: cmux-selfbuild-arm64-${{ steps.ghostty.outputs.short }}
           path: cmux-selfbuild-arm64.zip
           if-no-files-found: error
           retention-days: 30
+
+      - name: Send email notification
+        # Runs whether the job above succeeded or failed (`always()`). Uses
+        # secrets stored at repo level (Settings → Secrets → Actions).
+        # GitHub-hosted runners have unrestricted SMTP egress, unlike the
+        # Anthropic remote-agent sandbox that triggers this workflow.
+        if: always()
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          TO_ADDR: ${{ secrets.TO_ADDR }}
+          JOB_STATUS: ${{ job.status }}
+          GHOSTTY_SHORT: ${{ steps.ghostty.outputs.short }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          ARTIFACT_SIZE: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set +e
+          if [ "$JOB_STATUS" = 'success' ]; then
+            SUBJ="✅ cmux 自编版就绪 · ghostty ${GHOSTTY_SHORT}"
+            BODY="本次 cmux 自编版构建完成。
+
+Ghostty SHA: ${GHOSTTY_SHORT}
+GitHub Actions Run: ${RUN_URL}
+Artifact 直链 (登录 GitHub 后可点): ${ARTIFACT_URL}
+
+下载方式 (二选一):
+  A. 浏览器登录 wqq-java 后直接点上面 Artifact 直链
+  B. 打开 Run URL → 滚到底部 Artifacts 区 → 点 zip
+
+下载到 ~/Downloads/ 之后, 终端跑这条:
+cd ~/Downloads && osascript -e 'quit app \"cmux\"' 2>/dev/null; sleep 2; rm -rf /Applications/cmux.app && unzip -o cmux-selfbuild-arm64*.zip && mv cmux.app /Applications/ && xattr -dr com.apple.quarantine /Applications/cmux.app && open /Applications/cmux.app
+
+--
+本邮件由 GitHub Actions 自动发送 (workflow 内嵌 Python smtplib)
+下次构建时间: 每周一 10:00 Asia/Shanghai (由 Claude Code routine 触发)"
+          else
+            SUBJ="❌ cmux 自编版构建失败"
+            BODY="本次 cmux 自编版构建失败 (job.status=${JOB_STATUS})。
+
+Run URL (点开看哪一步挂了): ${RUN_URL}
+
+排查思路:
+- Ghostty SHA: ${GHOSTTY_SHORT} (可能 manaflow upstream 刚合了破坏性改动, 上游 prebuilt 还没出)
+- 也可能 Xcode runner image 升级了 Apple SDK 不兼容
+- 等 1-2 天 manaflow 那边修了再手动重跑通常就好
+
+要立即重跑: 去 https://github.com/${{ github.repository }}/actions/workflows/my-build.yml 点 Run workflow"
+          fi
+
+          export SUBJ
+          export BODY
+          cat > /tmp/send_mail.py <<'PY'
+          import os, smtplib, ssl, sys
+          from email.mime.text import MIMEText
+          from email.header import Header
+          msg = MIMEText(os.environ['BODY'], 'plain', 'utf-8')
+          msg['Subject'] = Header(os.environ['SUBJ'], 'utf-8')
+          msg['From'] = os.environ['SMTP_USER']
+          msg['To'] = os.environ['TO_ADDR']
+          try:
+              ctx = ssl.create_default_context()
+              with smtplib.SMTP('smtp.gmail.com', 587, timeout=30) as s:
+                  s.starttls(context=ctx)
+                  s.login(os.environ['SMTP_USER'], os.environ['SMTP_PASS'].replace(' ', ''))
+                  s.sendmail(os.environ['SMTP_USER'], [os.environ['TO_ADDR']], msg.as_string())
+              print('email sent OK')
+          except Exception as e:
+              print(f'email FAILED: {e}', file=sys.stderr)
+              sys.exit(1)
+          PY
+          python3 /tmp/send_mail.py
