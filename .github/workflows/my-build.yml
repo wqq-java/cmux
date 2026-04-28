@@ -160,11 +160,14 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :SUEnableAutomaticChecks false" "$APP_PLIST" 2>/dev/null \
             || /usr/libexec/PlistBuddy -c "Add :SUEnableAutomaticChecks bool false" "$APP_PLIST"
           SHORT_SHA="${{ steps.ghostty.outputs.short }}"
-          /usr/libexec/PlistBuddy -c "Add :CMUXSelfBuild string selfbuild-ghostty-${SHORT_SHA}-$(date -u +%Y%m%d)" "$APP_PLIST" 2>/dev/null || true
+          BUILD_DATE_BJ="$(TZ=Asia/Shanghai date +%Y-%m-%d\ %H:%M)"
+          BUILD_DATE_TAG="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)"
+          /usr/libexec/PlistBuddy -c "Add :CMUXSelfBuild string selfbuild-ghostty-${SHORT_SHA}-${BUILD_DATE_TAG}" "$APP_PLIST" 2>/dev/null || true
           # About panel shows NSHumanReadableCopyright at the bottom. Use it as
           # a personal build marker so the About window tells the user "this is
-          # a self-build I made", not an official manaflow release.
-          COPY_TEXT="自编版 · 构建者 暮色微凉丶 · ghostty ${SHORT_SHA}"
+          # a self-build I made", not an official manaflow release. Includes the
+          # build timestamp (Asia/Shanghai) so a stale copy is obvious at a glance.
+          COPY_TEXT="自编版 · 构建者 暮色微凉丶 · ${BUILD_DATE_BJ} · ghostty ${SHORT_SHA}"
           /usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright '$COPY_TEXT'" "$APP_PLIST" 2>/dev/null \
             || /usr/libexec/PlistBuddy -c "Add :NSHumanReadableCopyright string '$COPY_TEXT'" "$APP_PLIST"
 
